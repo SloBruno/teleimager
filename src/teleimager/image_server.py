@@ -42,6 +42,8 @@ from pathlib import Path
 import queue
 import fractions
 from typing import Dict, Optional, Tuple, Any
+from .camera_telemetry import CameraTelemetry
+from .realsense_profile import apply_realsense_profile, normalize_profile
 
 # ========================================================
 # cam_config_server.yaml path
@@ -958,7 +960,7 @@ class RealSenseCamera(BaseCamera):
         aligned_frames = self.align.process(frames)
         color_frame = aligned_frames.get_color_frame()
         if not color_frame:
-            return None
+            return False
 
         if self._enable_depth:   
             depth_frame = aligned_frames.get_depth_frame()
@@ -979,6 +981,7 @@ class RealSenseCamera(BaseCamera):
         
         if not self._ready.is_set():
             self._ready.set()
+        return True
     
     def get_depth_frame(self):
         if self._latest_depth is None:
@@ -1212,12 +1215,17 @@ class ImageServer:
         self._zmq_publisher_manager = ZMQ_PublisherManager.get_instance()
         self._webrtc_publisher_manager = WebRTC_PublisherManager.get_instance()
         self._publisher_threads = []  # keep references for graceful join
+        # In-memory only: capture threads must never log or perform I/O on
+        # every UVC failure.
+        self._camera_telemetry: dict[str, CameraTelemetry] = {}
 
         try:
             # Load cameras from self.cam_config
             for cam_topic, cam_cfg in self._cam_config.items():
                 if not cam_cfg.get("enable_zmq", False) and not cam_cfg.get("enable_webrtc", False):
                     continue
+
+                self._camera_telemetry[cam_topic] = CameraTelemetry()
 
                 enable_zmq = cam_cfg.get("enable_zmq", False)
                 zmq_port = cam_cfg.get("zmq_port", None)
@@ -1335,11 +1343,15 @@ class ImageServer:
             next_frame_time = time.monotonic()
             while not self._stop_event.is_set():
                 try:
-                    camera._update_frame()
-                except Exception as e:
-                    logger_mp.error(f"[Image Server] Error updating frame for {cam_topic} camera")
-                    self._stop_event.set()
-                    break
+                    captured = camera._update_frame()
+                    if captured is False:
+                        self._camera_telemetry[cam_topic].capture_error()
+                    else:
+                        self._camera_telemetry[cam_topic].capture_ok()
+                except Exception:
+                    # Preserve the last valid JPEG/BGR buffers on a UVC error:
+                    # one failed camera must not stop the remaining streams.
+                    self._camera_telemetry[cam_topic].capture_error()
                 next_frame_time += interval
                 sleep_time = next_frame_time - time.monotonic()
                 if sleep_time > 0:
@@ -1359,10 +1371,9 @@ class ImageServer:
                 jpeg_bytes = camera.get_jpeg_bytes()
                 if jpeg_bytes is not None:
                     self._zmq_publisher_manager.publish(jpeg_bytes, camera.get_zmq_port())
+                    self._camera_telemetry[cam_topic].publish_ok()
                 else:
-                    logger_mp.warning(f"[Image Server] {cam_topic} returned no frame.")
-                    self._stop_event.set()
-                    break
+                    self._camera_telemetry[cam_topic].publish_error()
 
                 next_frame_time += interval
                 sleep_time = next_frame_time - time.monotonic()
@@ -1370,9 +1381,8 @@ class ImageServer:
                     time.sleep(sleep_time)
                 else:
                     next_frame_time = time.monotonic()
-        except Exception as e:
-            logger_mp.error(f"[Image Server] Failed to publish zmq frame from {cam_topic} camera.")
-            self._stop_event.set()
+        except Exception:
+            self._camera_telemetry[cam_topic].publish_error()
     
     def _webrtc_pub(self, cam_topic: str, camera: BaseCamera):
         try:
@@ -1384,10 +1394,9 @@ class ImageServer:
 
                 if bgr_frame is not None:
                     self._webrtc_publisher_manager.publish(bgr_frame, camera.get_webrtc_port(), codec_pref=webrtc_codec)
+                    self._camera_telemetry[cam_topic].publish_ok()
                 else:
-                    logger_mp.info(f"[Image Server] {cam_topic} returned no frame.")
-                    self._stop_event.set()
-                    break
+                    self._camera_telemetry[cam_topic].publish_error()
 
                 next_frame_time += interval
                 sleep_time = next_frame_time - time.monotonic()
@@ -1395,9 +1404,8 @@ class ImageServer:
                     time.sleep(sleep_time)
                 else:
                     next_frame_time = time.monotonic()
-        except Exception as e:
-            logger_mp.error(f"[Image Server] Failed to publish rtc frame from {cam_topic} camera.")
-            self._stop_event.set()
+        except Exception:
+            self._camera_telemetry[cam_topic].publish_error()
 
     def _clean_up(self):
         self._responser.stop()
@@ -1469,6 +1477,10 @@ class ImageServer:
 
     def stop(self):
         self._stop_event.set()
+
+    def telemetry_snapshot(self):
+        """Return per-camera counters and last-success ages for diagnostics."""
+        return {topic: telemetry.snapshot() for topic, telemetry in self._camera_telemetry.items()}
 
 # ========================================================
 # utility functions
@@ -1547,6 +1559,12 @@ def main():
     except Exception as e:
         logger_mp.error(f"Failed to load configuration file at {CONFIG_PATH}: {e}")
         exit(1)
+
+    # USB2 is opt-in. It changes all configured RealSense cameras equally to
+    # 640x480@6 BGR; it never crops or fabricates a wider optical FOV.
+    profile = normalize_profile(os.getenv("XR_REALSENSE_PROFILE"))
+    cam_config = apply_realsense_profile(cam_config, profile)
+    logger_mp.info(f"[Image Server] RealSense profile: {profile}")
 
     # start image server
     server = ImageServer(cam_config, realsense_enable=args.rs, camera_finder_verbose=False)

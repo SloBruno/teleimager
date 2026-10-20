@@ -675,7 +675,10 @@ class ZMQ_Requester:
 # image client
 # ========================================================
 class ImageClient:
-    def __init__(self, host="192.168.123.164", request_port=60000, request_bgr: bool = False):
+    CAMERA_NAMES = ("head_camera", "left_wrist_camera", "right_wrist_camera")
+
+    def __init__(self, host="192.168.123.164", request_port=60000,
+                 request_bgr: bool = False, camera_names=None):
         """
         Args:
             server_address:   IP address of image host server
@@ -693,15 +696,19 @@ class ImageClient:
 
         if self._cam_config is None:
             raise RuntimeError("Failed to get camera configuration.")
-        
-        if self._cam_config['head_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
 
-        if self._cam_config['left_wrist_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
-
-        if self._cam_config['right_wrist_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
+        self._camera_names = self.CAMERA_NAMES if camera_names is None else tuple(camera_names)
+        unknown = set(self._camera_names) - set(self.CAMERA_NAMES)
+        if unknown:
+            raise ValueError(f"Unknown camera selection: {', '.join(sorted(unknown))}")
+        for camera_name in self.CAMERA_NAMES:
+            if (camera_name in self._camera_names and
+                    self._cam_config[camera_name]['enable_zmq']):
+                self._subscriber_manager.subscribe(
+                    self._host,
+                    self._cam_config[camera_name]['zmq_port'],
+                    request_bgr=self._request_bgr,
+                )
 
         if not self._cam_config['head_camera']['enable_zmq'] and not self._cam_config['head_camera']['enable_webrtc']:
             logger_mp.warning("[Image Client] NOTICE! Head camera is not enabled on both ZMQ and WebRTC.")
@@ -713,13 +720,20 @@ class ImageClient:
         return self._cam_config
 
     def get_head_frame(self):
+        self._require_selected('head_camera')
         return self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
     
     def get_left_wrist_frame(self):
+        self._require_selected('left_wrist_camera')
         return self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
     
     def get_right_wrist_frame(self):
+        self._require_selected('right_wrist_camera')
         return self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
+
+    def _require_selected(self, camera_name):
+        if camera_name not in self._camera_names:
+            raise RuntimeError(f"Camera stream was not selected: {camera_name}")
         
     def close(self):
         self._subscriber_manager.close()
